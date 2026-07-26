@@ -4,10 +4,7 @@ import authMiddleware from "../../middleware/auth.middleware.js";
 import { requirePermission } from "../../middleware/authorize.middleware.js";
 import validate from "../../middleware/validate.middleware.js";
 import * as kbController from "./kb.controller.js";
-import {
-  createKbApiSchema,
-  updateKbApiSchema,
-} from "./kb.schema.js";
+import { createKbApiSchema } from "./kb.schema.js";
 
 const router = Router();
 
@@ -33,14 +30,6 @@ router.get(
   authMiddleware,
   requirePermission({ knowledgeSource: ["create"] }),
   kbController.getUploadUrl
-);
-
-router.patch(
-  "/:kbId",
-  authMiddleware,
-  requirePermission({ knowledgeSource: ["update"] }),
-  validate(updateKbApiSchema),
-  kbController.updateKnowledgeSource,
 );
 
 router.delete(

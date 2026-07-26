@@ -6,8 +6,16 @@ QuickVoice has not published a stable release. Everything under `Unreleased` may
 
 ## Unreleased
 
-### Added
-
+- Langfuse SDK integration with SDK v4.x observation API and SDK v2/v3 compatibility.
+- Top-level `voice_call` root trace initialization with per-call context and multi-tenant tagging.
+- `stt_recognition` spans for audio transcription timing and model tracking.
+- `tool:<tool_name>` spans for HTTP and MCP tool execution monitoring.
+- `rag_retrieval` spans for Knowledge Base search query and match metrics.
+- LLM generation recording (`record_llm_generation`) with prompt/completion logging, model tracking, and token usage statistics.
+- Score recording (`record_score`) for evaluation feedback and user metrics.
+- Non-blocking asynchronous telemetry batch flushing (`flush_async`).
+- Multi-environment file loader (`.env.local`, `.env.dev`, `.env`) with automated fallback and zero-PII privacy controls.
+- Comprehensive error handling to prevent telemetry failures from interrupting call execution.
 - Project governance, maintainer responsibilities, support boundaries, and a public roadmap.
 - Structured GitHub issue forms for bugs, setup failures, documentation gaps, and feature proposals.
 - A contributor assignment and duplicate-work policy.

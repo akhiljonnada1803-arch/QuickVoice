@@ -472,9 +472,6 @@ model KnowledgeSource {
   storagePath      String
   sourceType       sourceType
   status           kbStatus
-  errorCode        String?
-  errorMessage     String?
-  errorRetryable   Boolean?
   metadata         Json?
   lastIndexedAt    DateTime?
   uploadedAt       DateTime     @default(now())

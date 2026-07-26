@@ -17,8 +17,6 @@ export interface KbJobData {
   agentId: string;
   organizationId: string;
   documents: KbJobDocument[];
-  replaceExisting?: boolean;
-  previousAgentId?: string | null;
 }
 
 export const kbQueue = new Queue<KbJobData, void, KbJobName>("kb-ingest", {

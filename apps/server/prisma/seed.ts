@@ -10,21 +10,42 @@
 // appended. Re-running will add more call logs, so run once per org unless
 // you want to pile up data.
 
-import "dotenv/config";
+import dotenv from "dotenv";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const serverRoot = path.resolve(__dirname, "../");
+for (const envFile of [".env.local", ".env.dev", ".env"]) {
+  dotenv.config({ path: path.join(serverRoot, envFile) });
+  dotenv.config({ path: path.resolve(process.cwd(), envFile) });
+}
+
 import { randomUUID } from "node:crypto";
+import bcrypt from "bcryptjs";
 import prisma from "../src/config/prisma.js";
 import type { CallStatus } from "./generated/prisma/enums.js";
 
-// -------- CLI parsing ---------------------------------------------------
+// -------- CLI parsing & Sanitization ------------------------------------
+function isValidSlug(val: string | undefined | null): val is string {
+  if (!val || typeof val !== "string") return false;
+  const trimmed = val.trim();
+  if (trimmed === "" || trimmed === "-" || trimmed === "--" || trimmed === "true" || trimmed === "false") {
+    return false;
+  }
+  return true;
+}
+
 function parseArgs() {
   const args: Record<string, string> = {};
   for (let i = 2; i < process.argv.length; i++) {
     const flag = process.argv[i];
     if (!flag?.startsWith("--")) continue;
     const key = flag.slice(2);
+    if (!key) continue;
     const next = process.argv[i + 1];
     if (next && !next.startsWith("--")) {
-      args[key] = next;
+      args[key] = next.trim();
       i++;
     } else {
       args[key] = "true";
@@ -131,63 +152,129 @@ const AGENT_RESPONSES = [
 // -------- Main ----------------------------------------------------------
 async function main() {
   const args = parseArgs();
-  const email = args.email;
-  const orgSlug = args["org-slug"];
+  const rawEmail = args.email;
+  const rawOrgSlug = args["org-slug"];
 
-  if (!email && !orgSlug) {
-    console.error(
-      "Usage: pnpm --filter server seed -- --email you@example.com\n" +
-        "   or: pnpm --filter server seed -- --org-slug my-workspace"
-    );
-    process.exit(1);
-  }
+  const email = (rawEmail && rawEmail !== "-" && rawEmail !== "true" && rawEmail.includes("@"))
+    ? rawEmail.trim()
+    : "test@example.com";
+  const orgSlug = isValidSlug(rawOrgSlug) ? rawOrgSlug.trim() : null;
 
-  // Resolve target user + org.
-  let user = null;
-  if (email) {
+  let creationAttempted = false;
+  let prismaError: string | null = null;
+  let user: any = null;
+  let organization: any = null;
+
+  try {
+    // 1. If explicit org-slug is provided, try looking up organization by slug.
+    if (orgSlug) {
+      organization = await prisma.organization.findUnique({
+        where: { slug: orgSlug },
+      });
+    }
+
+    // 2. Look up user by email.
     user = await prisma.user.findUnique({ where: { email } });
-    if (!user) {
-      console.error(`No user found with email "${email}"`);
-      process.exit(1);
+
+    // 3. If organization was not resolved via org-slug, but user exists, check user's membership.
+    if (!organization && user) {
+      const member = await prisma.member.findFirst({
+        where: { userId: user.id },
+        include: { organization: true },
+      });
+      organization = member?.organization ?? null;
     }
+
+    // 4. If organization is still not resolved, perform auto-creation.
+    if (!organization) {
+      creationAttempted = true;
+      console.log(`\n▸ Organization not resolved for target (email="${email}", orgSlug="${orgSlug ?? "(none)"}"). Auto-creating user & organization...`);
+
+      // Create user if missing
+      if (!user) {
+        const hashedPassword = await bcrypt.hash("Password123!", 10);
+        const userId = randomUUID();
+        user = await prisma.user.create({
+          data: {
+            id: userId,
+            name: "Test User",
+            email: email,
+            emailVerified: true,
+            accounts: {
+              create: {
+                id: randomUUID(),
+                accountId: email,
+                providerId: "credential",
+                password: hashedPassword,
+              },
+            },
+          },
+        });
+        console.log(`  ✓ Created user: ${user.email} (${user.id})`);
+      }
+
+      // Generate target organization slug
+      let targetSlug = orgSlug || (email.split("@")[0] + "-workspace").toLowerCase().replace(/[^a-z0-9-]/g, "-");
+
+      // Ensure targetSlug is unique
+      const existingOrgWithSlug = await prisma.organization.findUnique({ where: { slug: targetSlug } });
+      if (existingOrgWithSlug) {
+        targetSlug = `${targetSlug}-${randomUUID().slice(0, 6)}`;
+      }
+
+      const orgId = randomUUID();
+      organization = await prisma.organization.create({
+        data: {
+          id: orgId,
+          name: "Test Workspace",
+          slug: targetSlug,
+          createdAt: new Date(),
+          members: {
+            create: {
+              id: randomUUID(),
+              userId: user.id,
+              role: "owner",
+              createdAt: new Date(),
+            },
+          },
+        },
+      });
+      console.log(`  ✓ Created organization: "${organization.name}" (slug: ${organization.slug}, id: ${organization.id})`);
+    }
+
+    // 5. Ensure user exists (if organization was found by org-slug first)
+    if (!user && organization) {
+      const member = await prisma.member.findFirst({
+        where: { organizationId: organization.id },
+        include: { user: true },
+      });
+      if (member) {
+        user = member.user;
+      }
+    }
+  } catch (err: any) {
+    prismaError = err?.message || String(err);
   }
 
-  let organization;
-  if (orgSlug) {
-    organization = await prisma.organization.findUnique({
-      where: { slug: orgSlug },
-    });
-  } else if (user) {
-    const member = await prisma.member.findFirst({
-      where: { userId: user.id },
-      include: { organization: true },
-    });
-    organization = member?.organization ?? null;
-  }
-
-  if (!organization) {
-    console.error(
-      `No organization found (email=${email ?? "—"}, slug=${orgSlug ?? "—"}).`
-    );
+  // 6. Detailed diagnostic error reporting if resolution/creation failed
+  if (!organization || !user) {
+    console.error(`\n✗ Seed Error: Failed to resolve target organization and user.`);
+    console.error(`  Diagnostics:`);
+    console.error(`    Attempted Email      : "${email}" (raw: "${rawEmail ?? "(none)"}")`);
+    console.error(`    Attempted Org Slug   : "${orgSlug ?? "(none)"}" (raw: "${rawOrgSlug ?? "(none)"}")`);
+    console.error(`    User Resolved        : ${user ? `${user.email} (${user.id})` : "NO"}`);
+    console.error(`    Organization Resolved: ${organization ? `${organization.name} (${organization.id})` : "NO"}`);
+    console.error(`    Creation Attempted   : ${creationAttempted ? "YES" : "NO"}`);
+    if (prismaError) {
+      console.error(`    Prisma Exception     : ${prismaError}`);
+    }
     process.exit(1);
-  }
-
-  // If we only had orgSlug, pick any member user to attach rows to.
-  if (!user) {
-    const member = await prisma.member.findFirst({
-      where: { organizationId: organization.id },
-      include: { user: true },
-    });
-    if (!member) {
-      console.error(`Organization has no members — cannot seed without a user.`);
-      process.exit(1);
-    }
-    user = member.user;
   }
 
   console.log(
     `\n▸ Seeding organization "${organization.name}" (${organization.id}) for user ${user.email}\n`
   );
+
 
   // -------- Agents + configurations ------------------------------------
   const agents: { agentId: string; name: string }[] = [];

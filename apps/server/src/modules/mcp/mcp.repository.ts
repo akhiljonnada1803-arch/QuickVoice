@@ -92,12 +92,12 @@ export const findConnectionForAgent = (
     },
   });
 
-export const upsertCustomCatalogItem = (data: {
+export const createCatalogItem = (data: {
   organizationId: string;
   slug: string;
   name: string;
   description: string;
-  source: "CUSTOM";
+  source: "SMITHERY" | "CUSTOM";
   provider: string;
   mcpUrl: string;
   smitheryServerKey?: string | null;
@@ -107,27 +107,10 @@ export const upsertCustomCatalogItem = (data: {
   toolCount?: number;
   metadata?: unknown;
 }) =>
-  prisma.mcpServerCatalogItem.upsert({
-    where: {
-      organizationId_slug: {
-        organizationId: data.organizationId,
-        slug: data.slug,
-      },
-    },
-    create: {
+  prisma.mcpServerCatalogItem.create({
+    data: {
       ...data,
       categories: data.categories,
-      metadata: jsonOrNull(data.metadata),
-    },
-    update: {
-      name: data.name,
-      description: data.description,
-      provider: data.provider,
-      mcpUrl: data.mcpUrl,
-      authType: data.authType,
-      categories: data.categories,
-      verified: data.verified,
-      toolCount: data.toolCount,
       metadata: jsonOrNull(data.metadata),
     },
   });

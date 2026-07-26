@@ -5,7 +5,6 @@ import { assertSafeRemoteUrl } from "../../lib/url-safety.js";
 import { redactJson } from "../../lib/redaction.js";
 import { findCuratedMcp, curatedMcpCatalog } from "./mcp.catalog.js";
 import * as repository from "./mcp.repository.js";
-import { resolveSmitheryNamespace } from "./smithery-namespace.js";
 import type { ConnectMcpInput, ExecuteMcpToolInput } from "./mcp.schema.js";
 
 type McpStatus = "PENDING" | "CONNECTED" | "AUTH_REQUIRED" | "INPUT_REQUIRED" | "ERROR" | "DISCONNECTED";
@@ -33,16 +32,14 @@ type CatalogItemLike = {
   metadata?: Record<string, unknown> | null;
 };
 
-const SMITHERY_NAMESPACE = process.env.SMITHERY_NAMESPACE;
+const SMITHERY_NAMESPACE = process.env.SMITHERY_NAMESPACE || "quickvoice";
 const SMITHERY_RUN_BASE_URL = process.env.SMITHERY_RUN_BASE_URL || "https://smithery.run";
 const SMITHERY_API_BASE_URL = process.env.SMITHERY_API_BASE_URL || "https://api.smithery.ai";
 
 const getSmitheryApiKey = () => {
   const key = process.env.SMITHERY_API_KEY;
   if (!key) {
-    throw new BadRequestError(
-      "MCP connections are not configured. Ask an administrator to add a Smithery API key."
-    );
+    throw new BadRequestError("SMITHERY_API_KEY is required to connect MCP servers");
   }
   return key;
 };
@@ -65,23 +62,11 @@ const normalizeStatus = (state: unknown): McpStatus => {
   return "PENDING";
 };
 
-const connectionApiUrl = (namespace: string, connectionId: string) =>
-  `${SMITHERY_API_BASE_URL.replace(/\/$/, "")}/connect/${encodeURIComponent(namespace)}/${encodeURIComponent(connectionId)}`;
+const connectionUrl = (namespace: string, connectionId: string) =>
+  `${SMITHERY_RUN_BASE_URL.replace(/\/$/, "")}/${encodeURIComponent(namespace)}/${encodeURIComponent(connectionId)}`;
 
 const smitherySetupUrl = (namespace: string, connectionId: string) =>
-  `${SMITHERY_RUN_BASE_URL.replace(/\/$/, "")}/${encodeURIComponent(namespace)}/${encodeURIComponent(connectionId)}/setup`;
-
-const smitheryState = (connection: Record<string, any>) =>
-  typeof connection.status === "string"
-    ? connection.status
-    : connection.status?.state ?? connection.state;
-
-const smitheryAuthorizationUrl = (connection: Record<string, any>) =>
-  connection.authorizationUrl ??
-  connection.status?.authorizationUrl ??
-  connection.status?.setupUrl ??
-  connection.setupUrl ??
-  null;
+  `${connectionUrl(namespace, connectionId)}/setup`;
 
 const isGoogleDriveMcp = (mcpUrl: string) =>
   mcpUrl.toLowerCase().includes("server.smithery.ai/googledrive");
@@ -190,12 +175,11 @@ const checkGoogleDriveScopes = async (namespace: string, connectionId: string) =
 const upsertSmitheryConnection = async (args: {
   namespace: string;
   connectionId: string;
-  displayName: string;
   mcpUrl: string;
   organizationId: string;
   userId: string | null;
 }) => {
-  const response = await fetch(connectionApiUrl(args.namespace, args.connectionId), {
+  const response = await fetch(connectionUrl(args.namespace, args.connectionId), {
     method: "PUT",
     headers: {
       Authorization: `Bearer ${getSmitheryApiKey()}`,
@@ -203,7 +187,6 @@ const upsertSmitheryConnection = async (args: {
     },
     body: JSON.stringify({
       mcpUrl: args.mcpUrl,
-      name: args.displayName,
       metadata: {
         organizationId: args.organizationId,
         userId: args.userId,
@@ -213,20 +196,7 @@ const upsertSmitheryConnection = async (args: {
 
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const message = String(body?.message ?? "");
-    if (
-      [401, 403, 404].includes(response.status) &&
-      /credential|namespace|token|unauthor|forbidden/i.test(message)
-    ) {
-      throw new BadRequestError(
-        "MCP connections are not configured correctly. Ask an administrator to verify the Smithery API key."
-      );
-    }
-    throw new BadRequestError(
-      message
-        ? `Could not connect to the MCP endpoint: ${message}`
-        : "Could not connect to the MCP endpoint. Confirm that it is the full public HTTPS MCP URL."
-    );
+    throw new BadRequestError(body?.message || "Could not create Smithery connection");
   }
   return body;
 };
@@ -235,7 +205,7 @@ const disconnectSmitheryConnection = async (namespace: string, connectionId: str
   const key = process.env.SMITHERY_API_KEY;
   if (!key) return;
 
-  const response = await fetch(connectionApiUrl(namespace, connectionId), {
+  const response = await fetch(connectionUrl(namespace, connectionId), {
     method: "DELETE",
     headers: { Authorization: `Bearer ${key}` },
   });
@@ -362,27 +332,9 @@ export const connect = async (
   const connectionKey = slugify(rawConnectionKey);
   const smitheryConnectionId = `${organizationId.slice(0, 8)}-${connectionKey}`.slice(0, 96);
   const customSlug = slugify(displayName);
-  const smitheryNamespace = await resolveSmitheryNamespace({
-    apiBaseUrl: SMITHERY_API_BASE_URL,
-    apiKey: getSmitheryApiKey(),
-    preferredNamespace: SMITHERY_NAMESPACE,
-  });
-
-  const smithery = await upsertSmitheryConnection({
-    namespace: smitheryNamespace,
-    connectionId: smitheryConnectionId,
-    displayName,
-    mcpUrl,
-    organizationId,
-    userId,
-  });
-
-  // Persist a custom catalog row only after the remote connection has been
-  // accepted. Upsert also makes retries safe if an older failed attempt left a
-  // row with the same display-name slug.
   const persistedCatalogItem = catalogItem
     ? null
-    : await repository.upsertCustomCatalogItem({
+    : await repository.createCatalogItem({
         organizationId,
         slug: customSlug,
         name: displayName,
@@ -395,13 +347,18 @@ export const connect = async (
         verified: false,
       });
 
-  let status = normalizeStatus(smitheryState(smithery));
+  const smithery = await upsertSmitheryConnection({
+    namespace: SMITHERY_NAMESPACE,
+    connectionId: smitheryConnectionId,
+    mcpUrl,
+    organizationId,
+    userId,
+  });
+
+  let status = normalizeStatus(smithery?.status?.state ?? smithery?.state);
   let tools: unknown[] = [];
   let lastSyncedAt: Date | null = null;
-  let setupUrl: string | null = smitheryAuthorizationUrl(smithery);
-  if (!setupUrl && ["AUTH_REQUIRED", "INPUT_REQUIRED"].includes(status)) {
-    setupUrl = smitherySetupUrl(smitheryNamespace, smitheryConnectionId);
-  }
+  let setupUrl: string | null = smithery?.status?.setupUrl ?? smithery?.setupUrl ?? null;
   const metadata: Record<string, unknown> = {
     source: catalogItem ? "curated" : "custom",
     catalogSlug: catalogItem?.slug ?? null,
@@ -409,9 +366,9 @@ export const connect = async (
   };
 
   if (status === "CONNECTED") {
-    tools = await syncTools(smitheryNamespace, smitheryConnectionId).catch(() => []);
+    tools = await syncTools(SMITHERY_NAMESPACE, smitheryConnectionId).catch(() => []);
     if (isGoogleDriveMcp(mcpUrl)) {
-      const scopeCheck = await checkGoogleDriveScopes(smitheryNamespace, smitheryConnectionId).catch((err) => ({
+      const scopeCheck = await checkGoogleDriveScopes(SMITHERY_NAMESPACE, smitheryConnectionId).catch((err) => ({
         ok: false,
         error: err instanceof Error ? err.message : "Could not verify Google Drive access",
       }));
@@ -419,7 +376,7 @@ export const connect = async (
       metadata.lastProviderMethod = "google.apps.drive.v3.DriveFiles.List";
       if (!scopeCheck.ok) {
         status = "AUTH_REQUIRED";
-        setupUrl = setupUrl ?? smitherySetupUrl(smitheryNamespace, smitheryConnectionId);
+        setupUrl = setupUrl ?? smitherySetupUrl(SMITHERY_NAMESPACE, smitheryConnectionId);
         metadata.scopeIssue = "missing_google_drive_scope";
         metadata.lastScopeError = scopeCheck.error;
       } else {
@@ -438,7 +395,7 @@ export const connect = async (
     catalogItemId: dbCatalogItem?.mcpServerId ?? persistedCatalogItem?.mcpServerId ?? null,
     displayName,
     mcpUrl,
-    smitheryNamespace,
+    smitheryNamespace: SMITHERY_NAMESPACE,
     smitheryConnectionId,
     status,
     setupUrl,
@@ -485,20 +442,13 @@ export const refreshConnection = async (organizationId: string, mcpConnectionId:
       const smithery = await upsertSmitheryConnection({
         namespace: connection.smitheryNamespace,
         connectionId: connection.smitheryConnectionId,
-        displayName: connection.displayName,
         mcpUrl: connection.mcpUrl,
         organizationId: connection.organizationId,
         userId: connection.userId,
       });
       smitheryStatus = smithery?.status ?? null;
-      status = normalizeStatus(smitheryState(smithery));
-      setupUrl = smitheryAuthorizationUrl(smithery) ?? connection.setupUrl;
-      if (!setupUrl && ["AUTH_REQUIRED", "INPUT_REQUIRED"].includes(status)) {
-        setupUrl = smitherySetupUrl(
-          connection.smitheryNamespace,
-          connection.smitheryConnectionId
-        );
-      }
+      status = normalizeStatus(smithery?.status?.state ?? smithery?.state);
+      setupUrl = smithery?.status?.setupUrl ?? smithery?.setupUrl ?? connection.setupUrl;
     } catch {
       status = connection.status === "AUTH_REQUIRED" || connection.status === "INPUT_REQUIRED"
         ? connection.status

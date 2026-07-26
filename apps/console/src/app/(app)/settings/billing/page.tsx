@@ -78,22 +78,12 @@ export default function BillingPage() {
  setLoading(true);
  try {
  const sub = authClient.subscription as {
- list?: (input: {
- query: {
- referenceId: string;
- customerType: "organization";
- };
- }) => Promise<{
+ list?: (input: { query: { referenceId: string } }) => Promise<{
  data?: Sub[];
  }>;
  };
  if (sub.list) {
- const result = await sub.list({
- query: {
- referenceId: orgId,
- customerType: "organization",
- },
- });
+ const result = await sub.list({ query: { referenceId: orgId } });
  const active = result.data?.find(
  (s) => (s as Sub).status === "active" || (s as Sub).status === "trialing"
  );
@@ -119,7 +109,6 @@ export default function BillingPage() {
  upgrade?: (input: {
  plan: string;
  referenceId: string;
- customerType: "organization";
  successUrl?: string;
  cancelUrl?: string;
  }) => Promise<{ data?: unknown; error?: { message?: string } }>;
@@ -128,7 +117,6 @@ export default function BillingPage() {
  const { error } = await sub.upgrade({
  plan: planId,
  referenceId: orgId,
- customerType: "organization",
  successUrl: window.location.href,
  cancelUrl: window.location.href,
  });
@@ -147,14 +135,12 @@ export default function BillingPage() {
  const sub = authClient.subscription as {
  billingPortal?: (input: {
  referenceId: string;
- customerType: "organization";
  returnUrl?: string;
  }) => Promise<{ data?: { url?: string }; error?: { message?: string } }>;
  };
  if (!sub.billingPortal) throw new Error("Billing portal is not available");
  const { data, error } = await sub.billingPortal({
  referenceId: orgId,
- customerType: "organization",
  returnUrl: window.location.href,
  });
  if (error || !data?.url) throw new Error(error?.message ?? "No portal URL");

@@ -25,6 +25,8 @@ from handlers.mcp_handler import build_mcp_tool_instructions, call_mcp_tool, par
 from handlers.privacy_handler import should_store_call_audio
 from handlers.rag_handler import RagRetrievalError, get_rag_context
 from handlers.transcript_collector import TranscriptCollector
+from handlers.langfuse_tracer import LangfuseTracer
+from handlers.evaluation_engine import EvaluationEngine
 from handlers.worker_handler import (
     PREVIEW_TRANSCRIPT_TOPIC,
     apply_initiation_webhook_metadata,
@@ -42,6 +44,7 @@ from handlers.voice_worker_metadata import is_voice_session_metadata, parse_voic
 from utils.logger import logger
 from utils.logger import redact_sensitive
 import asyncio
+import contextlib
 import json
 from datetime import datetime, timezone
 import os
@@ -52,7 +55,10 @@ import sys
 import time
 
 APP_DIR = Path(__file__).resolve().parent
-load_dotenv(APP_DIR / ".env")
+for env_name in (".env.local", ".env.dev", ".env"):
+    env_file = APP_DIR / env_name
+    if env_file.exists():
+        load_dotenv(env_file)
 
 API_PORT = int(os.getenv("AI_API_PORT", "5555"))
 DEFAULT_SYSTEM_PROMPT = (
@@ -267,6 +273,7 @@ class Assistant(Agent):
         config: dict,
         call_context: dict,
         transcript_collector: TranscriptCollector | None = None,
+        tracer: Any = None,
     ):
         super().__init__(
             instructions=system_prompt,
@@ -276,6 +283,9 @@ class Assistant(Agent):
         self._call_context = call_context
         self._metadata_collector = CallMetadataCollector(config)
         self._transcript_collector = transcript_collector
+        self._tracer = tracer
+        self._executed_tool_calls: list[dict[str, Any]] = []
+        self._executed_rag_queries: list[dict[str, Any]] = []
 
     def _rag_enabled(self) -> bool:
         return bool(self._config.get("use_rag"))
@@ -303,9 +313,12 @@ class Assistant(Agent):
         if not query:
             return
 
+        zero_pii = bool(self._config.get("zero_pii_retention"))
         try:
-            context = await get_rag_context(agent_id=agent_id, query=query)
+            context = await get_rag_context(agent_id=agent_id, query=query, tracer=self._tracer, zero_pii=zero_pii)
+            self._executed_rag_queries.append({"query": query, "status": "hit" if context else "miss"})
         except RagRetrievalError:
+            self._executed_rag_queries.append({"query": query, "status": "error"})
             turn_ctx.add_message(
                 role="system",
                 content=(
@@ -333,14 +346,16 @@ class Assistant(Agent):
 
     async def transcription_node(self, text, model_settings):
         chunks: list[str] = []
-        output = Agent.default.transcription_node(self, text, model_settings)
-        if output is None:
-            return
-        async for chunk in output:
-            chunk_text = _transcription_chunk_text(chunk)
-            if chunk_text:
-                chunks.append(chunk_text)
-            yield chunk
+        cm = self._tracer.span_stt(model=self._config.get("stt_model")) if self._tracer and getattr(self._tracer, "is_active", False) else contextlib.nullcontext()
+        with cm:
+            output = Agent.default.transcription_node(self, text, model_settings)
+            if output is None:
+                return
+            async for chunk in output:
+                chunk_text = _transcription_chunk_text(chunk)
+                if chunk_text:
+                    chunks.append(chunk_text)
+                yield chunk
         if self._transcript_collector is not None:
             self._transcript_collector.on_agent_transcription_final(
                 "".join(chunks),
@@ -389,9 +404,12 @@ class Assistant(Agent):
         if not normalized_query:
             return "A search query is required."
 
+        zero_pii = bool(self._config.get("zero_pii_retention"))
         try:
-            context = await get_rag_context(str(agent_id), normalized_query, top_k=top_k)
+            context = await get_rag_context(str(agent_id), normalized_query, top_k=top_k, tracer=self._tracer, zero_pii=zero_pii)
+            self._executed_rag_queries.append({"query": normalized_query, "status": "hit" if context else "miss"})
         except RagRetrievalError:
+            self._executed_rag_queries.append({"query": normalized_query, "status": "error"})
             return "Knowledge base search is temporarily unavailable. Please try again later."
         return context or "No matching knowledge base context found."
 
@@ -405,13 +423,28 @@ class Assistant(Agent):
             arguments_json: A JSON object string containing the tool arguments.
         """
         arguments = parse_http_tool_arguments(arguments_json)
-        result = await call_http_tool(
-            tool_name=tool_name,
-            arguments=arguments,
-            config=self._config,
-            call_context=self._call_context,
-        )
-        return json.dumps(result.get("data", result), ensure_ascii=False)
+        zero_pii = bool(self._config.get("zero_pii_retention"))
+        cm = self._tracer.span_tool(tool_name=tool_name, tool_type="http", arguments=arguments, zero_pii=zero_pii) if self._tracer and getattr(self._tracer, "is_active", False) else contextlib.nullcontext({})
+        with cm as tool_meta:
+            try:
+                result = await call_http_tool(
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    config=self._config,
+                    call_context=self._call_context,
+                )
+                data = result.get("data", result)
+                if isinstance(tool_meta, dict):
+                    tool_meta["result"] = data
+                    tool_meta["status"] = "success"
+                self._executed_tool_calls.append({"tool_name": tool_name, "tool_type": "http", "status": "success"})
+                return json.dumps(data, ensure_ascii=False)
+            except Exception as exc:
+                if isinstance(tool_meta, dict):
+                    tool_meta["status"] = "error"
+                    tool_meta["exception"] = str(exc)
+                self._executed_tool_calls.append({"tool_name": tool_name, "tool_type": "http", "status": "error", "error": str(exc)})
+                raise
 
     @function_tool
     async def call_mcp_tool(self, connection_id: str, tool_name: str, arguments_json: str = "{}") -> str:
@@ -424,14 +457,29 @@ class Assistant(Agent):
             arguments_json: A JSON object string containing the tool arguments.
         """
         arguments = parse_arguments_json(arguments_json)
-        result = await call_mcp_tool(
-            connection_id=connection_id,
-            tool_name=tool_name,
-            arguments=arguments,
-            config=self._config,
-            call_context=self._call_context,
-        )
-        return json.dumps(result.get("data", result), ensure_ascii=False)
+        zero_pii = bool(self._config.get("zero_pii_retention"))
+        cm = self._tracer.span_tool(tool_name=tool_name, tool_type="mcp", arguments=arguments, zero_pii=zero_pii) if self._tracer and getattr(self._tracer, "is_active", False) else contextlib.nullcontext({})
+        with cm as tool_meta:
+            try:
+                result = await call_mcp_tool(
+                    connection_id=connection_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    config=self._config,
+                    call_context=self._call_context,
+                )
+                data = result.get("data", result)
+                if isinstance(tool_meta, dict):
+                    tool_meta["result"] = data
+                    tool_meta["status"] = "success"
+                self._executed_tool_calls.append({"tool_name": tool_name, "tool_type": "mcp", "status": "success"})
+                return json.dumps(data, ensure_ascii=False)
+            except Exception as exc:
+                if isinstance(tool_meta, dict):
+                    tool_meta["status"] = "error"
+                    tool_meta["exception"] = str(exc)
+                self._executed_tool_calls.append({"tool_name": tool_name, "tool_type": "mcp", "status": "error", "error": str(exc)})
+                raise
 
 
 async def entrypoint(ctx: JobContext):
@@ -507,6 +555,19 @@ async def entrypoint(ctx: JobContext):
             }
         ),
     )
+
+    tracer = LangfuseTracer()
+    evaluation_engine = EvaluationEngine()
+    call_id = call_context.get("call_id") or ctx.room.name
+    tracer.start_trace(
+        call_id=call_id,
+        agent_id=call_context.get("agent_id") or config.get("agent_id"),
+        organization_id=config.get("organization_id"),
+        user_id=config.get("user_id"),
+        call_context=call_context,
+        config=config,
+    )
+
     session = AgentSession(
         **provider_kwargs,
         vad=silero.VAD.load(),
@@ -531,6 +592,7 @@ async def entrypoint(ctx: JobContext):
         config=config,
         call_context=call_context,
         transcript_collector=transcript_collector,
+        tracer=tracer,
     )
 
     @ctx.room.on("data_received")
@@ -595,6 +657,10 @@ async def entrypoint(ctx: JobContext):
         started_at=call_start_time,
         recording_path=recording_path,
         transcript_reader=transcript_collector.read,
+        tracer=tracer,
+        evaluation_engine=evaluation_engine,
+        tool_calls=agent._executed_tool_calls,
+        rag_queries=agent._executed_rag_queries,
     )
     shutdown_reason = "session_shutdown"
 
